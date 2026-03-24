@@ -1,0 +1,33 @@
+use jsonwebtoken::{encode, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claims {
+    pub user_id: i32,
+    pub email: String,
+    pub is_admin: bool,
+    pub exp: i64,
+}
+
+pub fn create_token(user_id: i32, email: &str, is_admin: bool) -> Result<String, String> {
+    let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
+    let expiry = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(7))
+        .expect("valid timestamp")
+        .timestamp();
+
+    let claims = Claims {
+        user_id,
+        email: email.to_string(),
+        is_admin,
+        exp: expiry,
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| format!("failed to create token: {}", e))
+}
