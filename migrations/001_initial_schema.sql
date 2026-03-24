@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS users (
     vjudge_handle    VARCHAR(100),
     codeforces_handle VARCHAR(100),
     is_admin      BOOLEAN DEFAULT false,
-    status        VARCHAR(20) DEFAULT 'pending'
+    status        VARCHAR(20) NOT NULL DEFAULT 'pending',
+    id_card_path  VARCHAR(255)
 );
 
 -- contests table

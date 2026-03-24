@@ -22,6 +22,7 @@ pub struct User {
     pub codeforces_handle: Option<String>,
     pub is_admin: Option<bool>,
     pub status: Option<String>,
+    pub id_card_path: Option<String>,
 }
 
 // maps to the contests table
