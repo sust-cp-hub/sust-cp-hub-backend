@@ -1,5 +1,5 @@
 pub mod app_state;
-pub mod config; // <-- Declared once here
+pub mod config;
 pub mod errors;
 pub mod handlers;
 pub mod middleware;
@@ -19,7 +19,6 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // db pool for neon postgres
-    // This now successfully calls the connect() function we made in database.rs!
     let pool = config::database::connect().await;
     let state = AppState { pool };
 

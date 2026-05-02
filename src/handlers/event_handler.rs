@@ -5,31 +5,115 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::app_state::AppState;
 use crate::errors::{require_admin_or_manager, AppError};
 use crate::models::event::{
     CreateEventInput, Event, EventResponse, TeamInput, TeamMemberWithProfile, TeamWithMembers,
+    UpdateEventInput,
 };
 use crate::utils::jwt::Claims;
 use crate::validation::validate_string;
 
+// helper rows for the join queries
 #[derive(sqlx::FromRow)]
 struct TeamRow {
     team_id: i32,
+    event_id: Option<i32>,
     coach_name: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
 struct MemberRow {
     member_id: i32,
+    team_id: Option<i32>,
     reg_number: String,
     user_id: Option<i32>,
     name: Option<String>,
 }
 
-// List all events with their teams and members
+// assembles teams + members for a set of event ids using batch queries instead of N+1
+async fn build_event_responses(
+    pool: &sqlx::PgPool,
+    events: Vec<Event>,
+) -> Result<Vec<EventResponse>, AppError> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let event_ids: Vec<i32> = events.iter().map(|e| e.event_id).collect();
+
+    // one query for ALL teams across all events
+    let teams = sqlx::query_as::<_, TeamRow>(
+        "SELECT team_id, event_id, coach_name FROM teams WHERE event_id = ANY($1) ORDER BY team_id ASC",
+    )
+    .bind(&event_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let team_ids: Vec<i32> = teams.iter().map(|t| t.team_id).collect();
+
+    // one query for ALL members across all teams, joined with users for profile info
+    let members = sqlx::query_as::<_, MemberRow>(
+        r#"SELECT tm.member_id, tm.team_id, tm.reg_number, u.user_id, u.name
+           FROM team_members tm
+           LEFT JOIN users u ON tm.reg_number = u.reg_number
+           WHERE tm.team_id = ANY($1)
+           ORDER BY tm.member_id ASC"#,
+    )
+    .bind(&team_ids)
+    .fetch_all(pool)
+    .await?;
+
+    // group members by team_id
+    let mut members_by_team: HashMap<i32, Vec<TeamMemberWithProfile>> = HashMap::new();
+    for m in members {
+        members_by_team
+            .entry(m.team_id.unwrap_or(0))
+            .or_default()
+            .push(TeamMemberWithProfile {
+                member_id: m.member_id,
+                reg_number: m.reg_number,
+                user_id: m.user_id,
+                name: m.name,
+            });
+    }
+
+    // group teams by event_id
+    let mut teams_by_event: HashMap<i32, Vec<TeamWithMembers>> = HashMap::new();
+    for t in teams {
+        let members = members_by_team.remove(&t.team_id).unwrap_or_default();
+        teams_by_event
+            .entry(t.event_id.unwrap_or(0))
+            .or_default()
+            .push(TeamWithMembers {
+                team_id: t.team_id,
+                coach_name: t.coach_name,
+                members,
+            });
+    }
+
+    // assemble final response
+    let response = events
+        .into_iter()
+        .map(|e| {
+            let teams = teams_by_event.remove(&e.event_id).unwrap_or_default();
+            EventResponse {
+                event_id: e.event_id,
+                description: e.description,
+                event_date: e.event_date,
+                teams,
+            }
+        })
+        .collect();
+
+    Ok(response)
+}
+
+// list all events with their teams and members (3 queries total, not N+1)
 pub async fn get_events(
+    _claims: Claims,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
     let events = sqlx::query_as::<_, Event>(
@@ -38,67 +122,37 @@ pub async fn get_events(
     .fetch_all(&state.pool)
     .await?;
 
-    let mut response_events = Vec::new();
-
-    for event in events {
-        // Fetch teams for this event
-        let teams_query = sqlx::query_as::<_, TeamRow>(
-            "SELECT team_id, coach_name FROM teams WHERE event_id = $1 ORDER BY team_id ASC"
-        )
-        .bind(event.event_id)
-        .fetch_all(&state.pool)
-        .await?;
-
-        let mut teams_response = Vec::new();
-
-        for team in teams_query {
-            // Fetch team members and join with users to get profile info
-            let members = sqlx::query_as::<_, MemberRow>(
-                r#"
-                SELECT tm.member_id, tm.reg_number, u.user_id, u.name 
-                FROM team_members tm
-                LEFT JOIN users u ON tm.reg_number = u.reg_number
-                WHERE tm.team_id = $1
-                ORDER BY tm.member_id ASC
-                "#
-            )
-            .bind(team.team_id)
-            .fetch_all(&state.pool)
-            .await?;
-
-            let mut members_response = Vec::new();
-            for member in members {
-                members_response.push(TeamMemberWithProfile {
-                    member_id: member.member_id,
-                    reg_number: member.reg_number,
-                    user_id: member.user_id,
-                    name: member.name,
-                });
-            }
-
-            teams_response.push(TeamWithMembers {
-                team_id: team.team_id,
-                coach_name: team.coach_name,
-                members: members_response,
-            });
-        }
-
-        response_events.push(EventResponse {
-            event_id: event.event_id,
-            description: event.description,
-            event_date: event.event_date,
-            teams: teams_response,
-        });
-    }
+    let response = build_event_responses(&state.pool, events).await?;
 
     Ok(Json(json!({
         "success": true,
-        "count": response_events.len(),
-        "data": response_events
+        "count": response.len(),
+        "data": response
     })))
 }
 
-// Create a new event (admin/manager only)
+// get a single event with its teams and members
+pub async fn get_event(
+    _claims: Claims,
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+) -> Result<Json<Value>, AppError> {
+    let event = sqlx::query_as::<_, Event>(
+        "SELECT * FROM events WHERE event_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let event = event.ok_or(AppError::NotFound("Event not found".to_string()))?;
+
+    let mut response = build_event_responses(&state.pool, vec![event]).await?;
+    let event_data = response.pop().unwrap();
+
+    Ok(Json(json!({"success": true, "data": event_data})))
+}
+
+// create a new event (admin/manager only)
 pub async fn create_event(
     claims: Claims,
     State(state): State<AppState>,
@@ -109,7 +163,11 @@ pub async fn create_event(
     validate_string(&body.description, "Description", 1, 10000)?;
 
     let event_date = NaiveDateTime::parse_from_str(&body.event_date, "%Y-%m-%dT%H:%M:%S")
-        .map_err(|_| AppError::BadRequest("Invalid event_date format (expected YYYY-MM-DDTHH:MM:SS)".to_string()))?;
+        .map_err(|_| {
+            AppError::BadRequest(
+                "Invalid event_date format (expected YYYY-MM-DDTHH:MM:SS)".to_string(),
+            )
+        })?;
 
     let event = sqlx::query_as::<_, Event>(
         r#"INSERT INTO events (description, event_date)
@@ -130,7 +188,55 @@ pub async fn create_event(
     ))
 }
 
-// Delete an event (admin/manager only)
+// update an event (admin/manager only) — partial update with merge
+pub async fn update_event(
+    claims: Claims,
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+    Json(body): Json<UpdateEventInput>,
+) -> Result<Json<Value>, AppError> {
+    require_admin_or_manager(&claims)?;
+
+    let existing = sqlx::query_as::<_, Event>(
+        "SELECT * FROM events WHERE event_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let existing = existing.ok_or(AppError::NotFound("Event not found".to_string()))?;
+
+    // merge: use new value if provided, keep existing if not
+    let new_description = body.description.unwrap_or(existing.description);
+    let new_date = match body.event_date {
+        Some(d) => NaiveDateTime::parse_from_str(&d, "%Y-%m-%dT%H:%M:%S").map_err(|_| {
+            AppError::BadRequest(
+                "Invalid event_date format (expected YYYY-MM-DDTHH:MM:SS)".to_string(),
+            )
+        })?,
+        None => existing.event_date,
+    };
+
+    validate_string(&new_description, "Description", 1, 10000)?;
+
+    let event = sqlx::query_as::<_, Event>(
+        r#"UPDATE events SET description = $1, event_date = $2
+           WHERE event_id = $3 RETURNING *"#,
+    )
+    .bind(&new_description)
+    .bind(new_date)
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Event updated",
+        "data": event
+    })))
+}
+
+// delete an event (admin/manager only)
 pub async fn delete_event(
     claims: Claims,
     State(state): State<AppState>,
@@ -153,38 +259,7 @@ pub async fn delete_event(
     })))
 }
 
-// Update an event (admin/manager only)
-pub async fn update_event(
-    claims: Claims,
-    State(state): State<AppState>,
-    Path(id): Path<i32>,
-    Json(body): Json<CreateEventInput>,
-) -> Result<Json<Value>, AppError> {
-    require_admin_or_manager(&claims)?;
-
-    validate_string(&body.description, "Description", 1, 10000)?;
-
-    let event_date = NaiveDateTime::parse_from_str(&body.event_date, "%Y-%m-%dT%H:%M:%S")
-        .map_err(|_| AppError::BadRequest("Invalid event_date format (expected YYYY-MM-DDTHH:MM:SS)".to_string()))?;
-
-    let result = sqlx::query("UPDATE events SET description = $1, event_date = $2 WHERE event_id = $3")
-        .bind(&body.description)
-        .bind(event_date)
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
-
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("Event not found".to_string()));
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Event updated successfully"
-    })))
-}
-
-// Add a team to an event (admin/manager only)
+// add a team to an event (admin/manager only)
 pub async fn add_team(
     claims: Claims,
     State(state): State<AppState>,
@@ -194,13 +269,15 @@ pub async fn add_team(
     require_admin_or_manager(&claims)?;
 
     if body.members.len() != 3 {
-        return Err(AppError::BadRequest("A team must have exactly 3 members".to_string()));
+        return Err(AppError::BadRequest(
+            "A team must have exactly 3 members".to_string(),
+        ));
     }
 
     let mut tx = state.pool.begin().await?;
 
     let team_id = sqlx::query_scalar::<_, i32>(
-        "INSERT INTO teams (event_id, coach_name) VALUES ($1, $2) RETURNING team_id"
+        "INSERT INTO teams (event_id, coach_name) VALUES ($1, $2) RETURNING team_id",
     )
     .bind(event_id)
     .bind(&body.coach_name)
@@ -209,13 +286,11 @@ pub async fn add_team(
 
     for reg_number in &body.members {
         validate_string(reg_number, "Registration number", 1, 50)?;
-        sqlx::query(
-            "INSERT INTO team_members (team_id, reg_number) VALUES ($1, $2)"
-        )
-        .bind(team_id)
-        .bind(reg_number)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO team_members (team_id, reg_number) VALUES ($1, $2)")
+            .bind(team_id)
+            .bind(reg_number)
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -229,7 +304,7 @@ pub async fn add_team(
     ))
 }
 
-// Update a team (admin/manager only)
+// update a team (admin/manager only) — replaces all members
 pub async fn update_team(
     claims: Claims,
     State(state): State<AppState>,
@@ -239,7 +314,9 @@ pub async fn update_team(
     require_admin_or_manager(&claims)?;
 
     if body.members.len() != 3 {
-        return Err(AppError::BadRequest("A team must have exactly 3 members".to_string()));
+        return Err(AppError::BadRequest(
+            "A team must have exactly 3 members".to_string(),
+        ));
     }
 
     let mut tx = state.pool.begin().await?;
@@ -254,22 +331,19 @@ pub async fn update_team(
         return Err(AppError::NotFound("Team not found".to_string()));
     }
 
-    // Delete existing members
+    // delete existing members and insert new ones
     sqlx::query("DELETE FROM team_members WHERE team_id = $1")
         .bind(team_id)
         .execute(&mut *tx)
         .await?;
 
-    // Insert new members
     for reg_number in &body.members {
         validate_string(reg_number, "Registration number", 1, 50)?;
-        sqlx::query(
-            "INSERT INTO team_members (team_id, reg_number) VALUES ($1, $2)"
-        )
-        .bind(team_id)
-        .bind(reg_number)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO team_members (team_id, reg_number) VALUES ($1, $2)")
+            .bind(team_id)
+            .bind(reg_number)
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -280,7 +354,7 @@ pub async fn update_team(
     })))
 }
 
-// Delete a team (admin/manager only)
+// delete a team (admin/manager only)
 pub async fn delete_team(
     claims: Claims,
     State(state): State<AppState>,

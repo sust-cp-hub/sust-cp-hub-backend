@@ -1,20 +1,16 @@
-use dotenvy::dotenv;
-use std::env;
-use sqlx::{postgres::PgPoolOptions, PgPool}; 
-
-pub fn get_database_url() -> String {
-    dotenv().ok(); 
-    env::var("DATABASE_URL")
-        .expect("Could not find DATABASE_URL in the .env file. Did you create it?")
-}
+use sqlx::{postgres::PgPoolOptions, PgPool};
 
 pub async fn connect() -> PgPool {
-    let database_url = get_database_url();
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env file");
 
-    // Create a connection pool to your Neon Postgres database
-    PgPoolOptions::new()
+    // explicit pool size — neon free tier works best with 5
+    let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await
-        .expect("Failed to connect to the Postgres database")
+        .expect("Failed to connect to database");
+
+    tracing::info!("connected to database");
+    pool
 }
