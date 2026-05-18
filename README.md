@@ -60,7 +60,7 @@ The server starts at **`http://localhost:8080`**
 
 | Group | Endpoints | Access |
 |-------|-----------|--------|
-| Auth | `register`, `verify-otp`, `resend-otp`, `login` | Public |
+| Auth | `register`, `verify-otp`, `resend-otp`, `login`, `forgot-password`, `reset-password` | Public |
 | Profile | `get_me`, `update_me` | User |
 | Codeforces | `profile/{id}`, `leaderboard` | User |
 | VJudge Ranker | `analyze`, `pdf/{session_id}` | Public |

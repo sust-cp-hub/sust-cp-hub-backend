@@ -190,6 +190,69 @@ Login and receive a JWT token. Only `active` accounts can login.
 
 ---
 
+### POST `/api/auth/forgot-password`
+Initiate a password reset. Returns the account holder's name and sends a 6-digit OTP to the email.
+
+**Access:** Public
+
+**Request:**
+```json
+{
+  "email": "neel@student.sust.edu"
+}
+```
+
+**Success (200):**
+```json
+{
+  "success": true,
+  "name": "Neel Mahmud",
+  "message": "Password reset code sent — check your email"
+}
+```
+
+> The `name` field lets the frontend confirm to the user which account they're resetting.
+
+**Errors:**
+- `400` — Account is pending verification or has been rejected
+- `404` — No account found with this email
+
+---
+
+### POST `/api/auth/reset-password`
+Verify the reset OTP and set a new password. This is a single-step endpoint — provide the OTP and new password together.
+
+**Access:** Public
+
+**Request:**
+```json
+{
+  "email": "neel@student.sust.edu",
+  "code": "847293",
+  "new_password": "mynewsecurepassword"
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `email` | string | Yes | The email used in `/forgot-password` |
+| `code` | string | Yes | 6-digit OTP from the reset email |
+| `new_password` | string | Yes | 6-255 characters |
+
+**Success (200):**
+```json
+{
+  "success": true,
+  "message": "Password reset successfully — you can now log in with your new password"
+}
+```
+
+**Errors:**
+- `400` — Invalid or expired reset code
+- `400` — New password too short
+
+---
+
 ## 2. User Profile
 
 ### GET `/api/users/me`

@@ -231,3 +231,99 @@ pub async fn login(
         }
     })))
 }
+
+// --- forgot password flow ---
+
+#[derive(Debug, Deserialize)]
+pub struct ForgotPasswordInput {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordInput {
+    pub email: String,
+    pub code: String,
+    pub new_password: String,
+}
+
+// step 1: user provides email, we return the account name and send an otp
+pub async fn forgot_password(
+    State(state): State<AppState>,
+    Json(body): Json<ForgotPasswordInput>,
+) -> Result<Json<Value>, AppError> {
+    validate_email(&body.email)?;
+
+    // look up the user — return vague error to prevent user enumeration
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
+        .bind(&body.email)
+        .fetch_optional(&state.pool)
+        .await?;
+
+    let user = user.ok_or(AppError::NotFound(
+        "No account found with this email".to_string(),
+    ))?;
+
+    // only active or pending users can reset — rejected/banned users cannot
+    match user.status.as_deref() {
+        Some("pending_verification") => {
+            return Err(AppError::BadRequest(
+                "Please verify your email first before resetting password".to_string(),
+            ));
+        }
+        Some("rejected") => {
+            return Err(AppError::BadRequest(
+                "This account has been rejected".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    // generate and send otp
+    let code = otp::generate_otp();
+    otp::store_otp(&state.pool, &body.email, &code).await?;
+    email::send_password_reset_email(&body.email, &code).await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "name": user.name,
+        "message": "Password reset code sent — check your email"
+    })))
+}
+
+// step 2: user provides email + otp + new password, we reset the password
+pub async fn reset_password(
+    State(state): State<AppState>,
+    Json(body): Json<ResetPasswordInput>,
+) -> Result<Json<Value>, AppError> {
+    validate_email(&body.email)?;
+    validate_string(&body.code, "OTP code", 6, 6)?;
+    validate_string(&body.new_password, "New password", 6, 255)?;
+
+    // verify the otp
+    let is_valid = otp::verify_otp(&state.pool, &body.email, &body.code).await?;
+
+    if !is_valid {
+        return Err(AppError::BadRequest(
+            "Invalid or expired reset code".to_string(),
+        ));
+    }
+
+    // hash the new password
+    let salt = SaltString::generate(&mut OsRng);
+    let hashed = Argon2::default()
+        .hash_password(body.new_password.as_bytes(), &salt)
+        .map_err(|e| AppError::InternalError(format!("Failed to hash password: {}", e)))?
+        .to_string();
+
+    // update the password in the database
+    sqlx::query("UPDATE users SET password = $1 WHERE email = $2")
+        .bind(&hashed)
+        .bind(&body.email)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Password reset successfully — you can now log in with your new password"
+    })))
+}

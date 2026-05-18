@@ -8,4 +8,6 @@ pub fn routes() -> Router<AppState> {
         .route("/login", post(auth_handler::login))
         .route("/verify-otp", post(auth_handler::verify_otp_handler))
         .route("/resend-otp", post(auth_handler::resend_otp_handler))
+        .route("/forgot-password", post(auth_handler::forgot_password))
+        .route("/reset-password", post(auth_handler::reset_password))
 }
